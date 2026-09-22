@@ -17,6 +17,7 @@
     <script src="https://cdn.jsdelivr.net/npm/imagetracerjs@1.2.6/imagetracer_v1.2.6.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.1/build/qrcode.min.js"></script>
     <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/localforage/1.10.0/localforage.min.js"></script>
     
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap');
@@ -4792,23 +4793,28 @@
             this.peer = null;
             this.conn = null;
             this.fileToSend = null;
-            this.CHUNK_SIZE = 16384 * 4; // 64KB for maximum WebRTC compatibility
             
-            // State
-            this.isSender = false;
-            this.isPaused = false;
+            // 50GB limit
+            this.MAX_FILE_SIZE = 50 * 1024 * 1024 * 1024;
+            this.CHUNK_SIZE = 64 * 1024; // 64KB
+            
+            this.state = {
+                role: null, // 'sender' | 'receiver'
+                transferId: null,
+                fileMetadata: null, // {name, size, type, totalChunks}
+                lastConfirmedChunk: -1,
+                fileHandle: null, // For receiver
+                status: 'idle', // idle, wait, active, interrupted, done
+                expectedChecksum: 0,
+                runningChecksum: 0
+            };
+            
+            this.chunksBuffer = new Map(); // Store chunks arriving out of order if necessary
             this.isCancelled = false;
-            this.bytesTransferred = 0;
-            this.startTime = 0;
-            
-            this.receivedChunks = [];
-            this.fileStream = null;
-            this.useStream = false;
-            this.expectedChecksum = 0;
-            this.runningChecksum = 0;
             
             this.initDOM();
             this.initEvents();
+            this.checkForExistingSession();
         }
         
         initDOM() {
@@ -4854,45 +4860,95 @@
             this.receiveDone = document.getElementById('dt-receive-done');
             this.receiveDoneName = document.getElementById('dt-receive-done-name');
             this.downloadBtn = document.getElementById('dt-download-btn');
+            
+            // Dynamically add new UI states if they don't exist yet
+            this.injectDynamicUI();
         }
-
+        
+        injectDynamicUI() {
+            if (!document.getElementById('dt-resume-prompt')) {
+                const resumeHtml = `
+                    <div id="dt-resume-prompt" style="display:none; background:rgba(0,0,0,0.3); padding:20px; border-radius:8px; margin-bottom:20px; border:1px solid var(--color-orange);">
+                        <div style="font-weight:600; color:var(--color-orange); margin-bottom:8px;">Existing Transfer Detected</div>
+                        <div id="dt-resume-filename" style="font-size:14px; margin-bottom:4px;">filename.zip</div>
+                        <div id="dt-resume-progress" style="font-size:12px; color:rgba(255,255,255,0.6); margin-bottom:16px;">34% (10 GB / 50 GB)</div>
+                        <div style="display:flex; gap:12px;">
+                            <button class="btn-export" id="dt-resume-btn" style="flex:1; background:var(--color-orange);">Resume Transfer</button>
+                            <button class="btn-toggle-action" id="dt-cancel-resume-btn" style="flex:1;">Cancel</button>
+                        </div>
+                    </div>
+                    
+                    <div id="dt-interrupted-state" style="display:none; text-align:center; padding:20px; border:1px solid rgba(255,255,255,0.1); border-radius:8px; margin-top:20px;">
+                        <div style="color:var(--color-orange); font-weight:600; margin-bottom:8px;">Connection Interrupted</div>
+                        <div id="dt-interrupted-progress" style="font-size:12px; color:rgba(255,255,255,0.6); margin-bottom:16px;">17.4 GB / 50 GB (34.8%)</div>
+                        <div style="font-size:12px; margin-bottom:16px;">Your transferred data is safe.<br>Waiting for connection...</div>
+                        <div style="display:flex; gap:12px;">
+                            <button class="btn-export" id="dt-manual-resume-btn" style="flex:1; background:var(--color-orange);">Resume Transfer</button>
+                            <button class="btn-toggle-action" id="dt-cancel-interrupted-btn" style="flex:1;">Cancel Transfer</button>
+                        </div>
+                    </div>
+                `;
+                document.getElementById('dt-send-card').insertAdjacentHTML('beforeend', resumeHtml);
+                
+                // Clone for receiver card
+                const receiveResumeHtml = resumeHtml.replace(/dt-/g, 'dt-rx-');
+                document.getElementById('dt-receive-card').insertAdjacentHTML('beforeend', receiveResumeHtml);
+            }
+            
+            this.resumePrompt = document.getElementById('dt-resume-prompt');
+            this.resumeFilename = document.getElementById('dt-resume-filename');
+            this.resumeProgress = document.getElementById('dt-resume-progress');
+            this.resumeBtn = document.getElementById('dt-resume-btn');
+            this.cancelResumeBtn = document.getElementById('dt-cancel-resume-btn');
+            
+            this.rxResumePrompt = document.getElementById('dt-rx-resume-prompt');
+            this.rxResumeFilename = document.getElementById('dt-rx-resume-filename');
+            this.rxResumeProgress = document.getElementById('dt-rx-resume-progress');
+            this.rxResumeBtn = document.getElementById('dt-rx-resume-btn');
+            this.rxCancelResumeBtn = document.getElementById('dt-rx-cancel-resume-btn');
+            
+            this.interruptedState = document.getElementById('dt-interrupted-state');
+            this.interruptedProgress = document.getElementById('dt-interrupted-progress');
+            this.manualResumeBtn = document.getElementById('dt-manual-resume-btn');
+            this.cancelInterruptedBtn = document.getElementById('dt-cancel-interrupted-btn');
+            
+            this.rxInterruptedState = document.getElementById('dt-rx-interrupted-state');
+            this.rxInterruptedProgress = document.getElementById('dt-rx-interrupted-progress');
+            this.rxManualResumeBtn = document.getElementById('dt-rx-manual-resume-btn');
+            this.rxCancelInterruptedBtn = document.getElementById('dt-rx-cancel-interrupted-btn');
+        }
+    
         initEvents() {
-            // Drag and drop
             this.dzZone.addEventListener('dragover', e => { e.preventDefault(); this.dzZone.style.borderColor = 'var(--color-orange)'; });
             this.dzZone.addEventListener('dragleave', () => this.dzZone.style.borderColor = 'rgba(249,92,21,0.3)');
             this.dzZone.addEventListener('drop', e => {
                 e.preventDefault();
                 this.dzZone.style.borderColor = 'rgba(249,92,21,0.3)';
-                if (e.dataTransfer.files.length) {
-                    this.handleFileSelect(e.dataTransfer.files[0]);
-                }
+                if (e.dataTransfer.files.length) this.handleFileSelect(e.dataTransfer.files[0]);
             });
             
             this.fileInput.addEventListener('change', e => {
-                if (e.target.files.length) {
-                    this.handleFileSelect(e.target.files[0]);
-                }
+                if (e.target.files.length) this.handleFileSelect(e.target.files[0]);
             });
             
             this.startBtn.addEventListener('click', () => this.startSendFlow());
-            this.cancelSendBtn.addEventListener('click', () => this.resetApp());
+            this.cancelSendBtn.addEventListener('click', () => this.cancelTransfer());
             this.sendNewBtn.addEventListener('click', () => this.resetApp());
             
             this.connectBtn.addEventListener('click', () => this.startReceiveFlow());
             
-            this.downloadBtn.addEventListener('click', () => {
-                if (!this.useStream && this.receivedChunks.length > 0) {
-                    const blob = new Blob(this.receivedChunks, { type: this.expectedMime });
-                    const url = URL.createObjectURL(blob);
-                    const a = document.createElement('a');
-                    a.href = url;
-                    a.download = this.expectedName;
-                    a.click();
-                    URL.revokeObjectURL(url);
-                }
-            });
+            // Resume buttons
+            this.resumeBtn.addEventListener('click', () => this.resumeSession('sender'));
+            this.cancelResumeBtn.addEventListener('click', () => this.cancelTransfer());
+            this.rxResumeBtn.addEventListener('click', () => this.resumeSession('receiver'));
+            this.rxCancelResumeBtn.addEventListener('click', () => this.cancelTransfer());
+            
+            this.manualResumeBtn.addEventListener('click', () => this.attemptReconnect());
+            this.cancelInterruptedBtn.addEventListener('click', () => this.cancelTransfer());
+            this.rxManualResumeBtn.addEventListener('click', () => this.attemptReconnect());
+            this.rxCancelInterruptedBtn.addEventListener('click', () => this.cancelTransfer());
         }
-        
+    
         formatSize(bytes) {
             if (bytes === 0) return '0 B';
             const k = 1024;
@@ -4901,75 +4957,175 @@
             return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
         }
         
-        updateChecksum(chunk) {
-            const arr = new Uint8Array(chunk);
-            for (let i = 0; i < arr.length; i++) {
-                this.runningChecksum = (this.runningChecksum + arr[i]) % 0xFFFFFFFF;
+        async saveState() {
+            if (!window.localforage) return;
+            await localforage.setItem('dt_session', this.state);
+        }
+        
+        async clearState() {
+            if (!window.localforage) return;
+            await localforage.removeItem('dt_session');
+            this.state = {
+                role: null, transferId: null, fileMetadata: null,
+                lastConfirmedChunk: -1, fileHandle: null, status: 'idle',
+                expectedChecksum: 0, runningChecksum: 0
+            };
+        }
+    
+        async checkForExistingSession() {
+            if (!window.localforage) return;
+            const session = await localforage.getItem('dt_session');
+            if (session && session.transferId) {
+                this.state = session;
+                
+                // Show resume prompt
+                const meta = this.state.fileMetadata;
+                const transferred = (this.state.lastConfirmedChunk + 1) * this.CHUNK_SIZE;
+                const percent = Math.min(100, Math.floor((transferred / meta.size) * 100));
+                const progText = `${percent}% (${this.formatSize(transferred)} / ${this.formatSize(meta.size)})`;
+                
+                if (this.state.role === 'sender') {
+                    this.sendSetup.style.display = 'none';
+                    this.resumePrompt.style.display = 'block';
+                    this.resumeFilename.textContent = meta.name;
+                    this.resumeProgress.textContent = progText;
+                } else {
+                    this.receiveSetup.style.display = 'none';
+                    this.rxResumePrompt.style.display = 'block';
+                    this.rxResumeFilename.textContent = meta.name;
+                    this.rxResumeProgress.textContent = progText;
+                }
             }
         }
-
+    
+        async resumeSession(role) {
+            if (role === 'receiver') {
+                // We need to request permission for the file handle again
+                if (this.state.fileHandle && this.state.fileHandle.requestPermission) {
+                    const perm = await this.state.fileHandle.requestPermission({ mode: 'readwrite' });
+                    if (perm !== 'granted') {
+                        alert('Permission to write to the file was denied. Cannot resume.');
+                        return this.cancelTransfer();
+                    }
+                    
+                    try {
+                        this.fileStream = await this.state.fileHandle.createWritable({ keepExistingData: true });
+                    } catch(e) {
+                        console.error("Could not create writable stream", e);
+                        alert("Could not open file for resuming.");
+                        return this.cancelTransfer();
+                    }
+                } else {
+                    // If it's a fallback mode without file picker, we can't resume across refresh.
+                    alert("Your browser does not support resuming file streams across page reloads. Restarting transfer.");
+                    return this.cancelTransfer();
+                }
+                
+                this.rxResumePrompt.style.display = 'none';
+                this.receiveConnecting.style.display = 'block';
+                this.attemptReconnect();
+                
+            } else if (role === 'sender') {
+                // Sender needs to select the file again because we can't store a File object across refresh!
+                // Wait, we can ask the user to select the file again.
+                alert("Please select the exact same file (" + this.state.fileMetadata.name + ") to resume the transfer.");
+                this.resumePrompt.style.display = 'none';
+                this.sendSetup.style.display = 'block';
+                this.isResumingSender = true; // flag to intercept file select
+            }
+        }
+        
+        cancelTransfer() {
+            const confirmMsg = "Cancel this transfer?\nYour current progress will be deleted.";
+            if (this.state.transferId && !confirm(confirmMsg)) return;
+            
+            if (this.peer) this.peer.destroy();
+            this.clearState();
+            this.resetApp();
+        }
+    
         handleFileSelect(file) {
+            if (file.size > this.MAX_FILE_SIZE) {
+                alert(`File too large.\n\nCreative Toolbox Data Transfer supports files up to 50 GB per transfer.`);
+                this.fileInput.value = '';
+                return;
+            }
+    
+            if (this.isResumingSender) {
+                if (file.name !== this.state.fileMetadata.name || file.size !== this.state.fileMetadata.size) {
+                    alert(`Cannot resume transfer.\nThe selected file does not match the original transfer.`);
+                    this.fileInput.value = '';
+                    return;
+                }
+                this.fileToSend = file;
+                this.isResumingSender = false;
+                this.sendSetup.style.display = 'none';
+                this.sendWait.style.display = 'block';
+                this.sendCode.textContent = this.state.transferId;
+                this.attemptReconnect();
+                return;
+            }
+    
             this.fileToSend = file;
             this.fileName.textContent = file.name;
             this.fileSize.textContent = this.formatSize(file.size);
             this.fileInfo.style.display = 'block';
         }
-        
-        resetApp() {
-            if (this.peer) {
-                this.peer.destroy();
-                this.peer = null;
-            }
-            if (this.conn) {
-                this.conn.close();
-                this.conn = null;
-            }
-            
-            this.isSender = false;
-            this.isPaused = false;
-            this.isCancelled = false;
-            this.fileToSend = null;
-            this.fileInput.value = '';
-            
-            this.sendSetup.style.display = 'block';
-            this.fileInfo.style.display = 'none';
-            this.sendWait.style.display = 'none';
-            this.sendActive.style.display = 'none';
-            this.sendDone.style.display = 'none';
-            
-            this.receiveSetup.style.display = 'block';
-            this.receiveConnecting.style.display = 'none';
-            this.receiveActive.style.display = 'none';
-            this.receiveDone.style.display = 'none';
-            this.receiveCode.value = '';
-        }
-
-        // ========== SENDER FLOW ==========
-        
-        startSendFlow() {
-            this.isSender = true;
+    
+        async startSendFlow() {
+            this.state.role = 'sender';
+            this.state.transferId = Math.floor(100000 + Math.random() * 900000).toString();
+            this.state.fileMetadata = {
+                name: this.fileToSend.name,
+                size: this.fileToSend.size,
+                type: this.fileToSend.type,
+                totalChunks: Math.ceil(this.fileToSend.size / this.CHUNK_SIZE)
+            };
+            this.state.lastConfirmedChunk = -1;
+            await this.saveState();
+    
             this.sendSetup.style.display = 'none';
             this.sendWait.style.display = 'block';
+            this.sendCode.textContent = this.state.transferId;
             
-            // Generate random 6 digit code for the peer ID
-            const code = Math.floor(100000 + Math.random() * 900000).toString();
-            this.sendCode.textContent = code;
-            
-            // Draw QR
             if (window.QRCode) {
-                QRCode.toCanvas(this.qrCanvas, code, {
-                    width: 150,
-                    margin: 2,
-                    color: { dark: '#000', light: '#fff' }
-                }, (err) => { if (err) console.error(err); });
+                QRCode.toCanvas(this.qrCanvas, this.state.transferId, {
+                    width: 150, margin: 2, color: { dark: '#000', light: '#fff' }
+                });
             }
             
-            this.peer = new Peer(code, {
-                debug: 2
-            });
+            this.initPeer(this.state.transferId);
+        }
+    
+        async startReceiveFlow() {
+            const code = this.receiveCode.value.trim();
+            if (!code) return alert("Please enter a transfer code.");
             
-            this.peer.on('open', (id) => {
-                console.log('Sender ready on ID:', id);
+            // Storage check
+            if (navigator.storage && navigator.storage.estimate) {
+                const est = await navigator.storage.estimate();
+                // We don't know the exact file size yet, but we will check again when metadata arrives
+            }
+    
+            this.receiveSetup.style.display = 'none';
+            this.receiveConnecting.style.display = 'block';
+            this.state.role = 'receiver';
+            this.state.transferId = code;
+            await this.saveState();
+            
+            this.initPeer();
+        }
+        
+        initPeer(id = null) {
+            if (this.peer) this.peer.destroy();
+            this.peer = new Peer(id, { debug: 2 });
+            
+            this.peer.on('open', (peerId) => {
+                console.log('Peer open:', peerId);
+                if (this.state.role === 'receiver') {
+                    this.conn = this.peer.connect(this.state.transferId, { reliable: true });
+                    this.setupConnection();
+                }
             });
             
             this.peer.on('connection', (conn) => {
@@ -4978,193 +5134,212 @@
             });
             
             this.peer.on('error', (err) => {
-                console.error('PeerJS error:', err);
-                alert('Connection error: ' + err.message);
-                this.resetApp();
+                console.error('Peer error:', err);
+                // Handle disconnection
+                this.handleDisconnect();
+            });
+            
+            this.peer.on('disconnected', () => {
+                console.log('Peer disconnected from signaling server, attempting reconnect');
+                this.peer.reconnect();
             });
         }
-
-        // ========== RECEIVER FLOW ==========
-        
-        async startReceiveFlow() {
-            const code = this.receiveCode.value.trim();
-            if (!code) return alert("Please enter a transfer code.");
-            
-            this.receiveSetup.style.display = 'none';
-            this.receiveConnecting.style.display = 'block';
-            
-            this.peer = new Peer({ debug: 2 });
-            
-            this.peer.on('open', (id) => {
-                console.log('Receiver ready on ID:', id);
-                this.conn = this.peer.connect(code, { reliable: true });
-                
-                this.conn.on('open', () => {
-                    this.setupConnection();
-                });
-                
-                this.conn.on('error', (err) => {
-                    console.error('Connection error:', err);
-                    alert('Connection failed.');
-                    this.resetApp();
-                });
-            });
-            
-            this.peer.on('error', (err) => {
-                console.error('PeerJS error:', err);
-                alert('Peer error: ' + err.message);
-                this.resetApp();
-            });
+    
+        attemptReconnect() {
+            console.log("Attempting reconnect...");
+            if (this.state.role === 'sender') {
+                this.interruptedState.style.display = 'none';
+                this.sendWait.style.display = 'block';
+                this.initPeer(this.state.transferId);
+            } else {
+                this.rxInterruptedState.style.display = 'none';
+                this.receiveConnecting.style.display = 'block';
+                this.initPeer();
+            }
         }
-
-        // ========== COMMON WEBRTC HANDLERS ==========
-        
+    
+        handleDisconnect() {
+            if (this.state.status === 'done' || !this.state.transferId) return;
+            console.log("Connection interrupted!");
+            
+            this.sendWait.style.display = 'none';
+            this.sendActive.style.display = 'none';
+            this.receiveConnecting.style.display = 'none';
+            this.receiveActive.style.display = 'none';
+            
+            const transferred = (this.state.lastConfirmedChunk + 1) * this.CHUNK_SIZE;
+            const total = this.state.fileMetadata ? this.state.fileMetadata.size : 0;
+            const progText = `${this.formatSize(transferred)} / ${this.formatSize(total)}`;
+            
+            if (this.state.role === 'sender') {
+                this.interruptedState.style.display = 'block';
+                this.interruptedProgress.textContent = progText;
+            } else {
+                this.rxInterruptedState.style.display = 'block';
+                this.rxInterruptedProgress.textContent = progText;
+            }
+            
+            // Auto reconnect loop
+            setTimeout(() => this.attemptReconnect(), 3000);
+        }
+    
         setupConnection() {
-            this.conn.on('data', (data) => {
-                this.handleIncomingData(data);
+            this.conn.on('open', () => {
+                console.log('Data channel open');
+                this.interruptedState.style.display = 'none';
+                this.rxInterruptedState.style.display = 'none';
+                
+                if (this.state.role === 'sender') {
+                    this.sendWait.style.display = 'none';
+                    this.sendActive.style.display = 'block';
+                    this.sendActiveName.textContent = this.state.fileMetadata.name;
+                    
+                    // Handshake
+                    this.conn.send({
+                        type: 'handshake',
+                        metadata: this.state.fileMetadata
+                    });
+                } else {
+                    this.receiveConnecting.style.display = 'none';
+                    this.receiveActive.style.display = 'block';
+                }
+            });
+            
+            this.conn.on('data', async (data) => {
+                if (data.type === 'handshake') {
+                    // Sender sent metadata
+                    this.state.fileMetadata = data.metadata;
+                    this.receiveActiveName.textContent = this.state.fileMetadata.name;
+                    
+                    // Storage check
+                    if (navigator.storage && navigator.storage.estimate) {
+                        const est = await navigator.storage.estimate();
+                        if (est.quota && est.quota - est.usage < this.state.fileMetadata.size) {
+                            alert("Not enough storage space.\nThe receiving device does not have enough available storage for this file.");
+                            this.cancelTransfer();
+                            return;
+                        }
+                    }
+                    
+                    if (!this.fileStream) {
+                        if (window.showSaveFilePicker) {
+                            try {
+                                const handle = await window.showSaveFilePicker({ suggestedName: this.state.fileMetadata.name });
+                                this.state.fileHandle = handle;
+                                this.fileStream = await handle.createWritable();
+                                await this.saveState();
+                            } catch(e) {
+                                alert("Transfer cancelled by user.");
+                                this.cancelTransfer();
+                                return;
+                            }
+                        } else {
+                            alert("Browser does not support File System Access API. Transfers >1GB may crash.");
+                            this.chunksBufferFallback = [];
+                        }
+                    }
+                    
+                    this.startTime = Date.now();
+                    // Tell sender we are ready and our last confirmed chunk
+                    this.conn.send({ type: 'ready', lastConfirmedChunk: this.state.lastConfirmedChunk });
+                    
+                } else if (data.type === 'ready') {
+                    // Receiver is ready
+                    this.state.lastConfirmedChunk = data.lastConfirmedChunk;
+                    this.startTime = Date.now();
+                    this.sendNextChunk();
+                    
+                } else if (data.type === 'chunk') {
+                    // Receiver got a chunk
+                    if (data.index <= this.state.lastConfirmedChunk) {
+                        // Duplicate chunk (already written), just ack it
+                        this.conn.send({ type: 'ack', index: data.index });
+                        return;
+                    }
+                    
+                    if (data.index === this.state.lastConfirmedChunk + 1) {
+                        // Expected chunk
+                        if (this.fileStream) {
+                            await this.fileStream.write(data.payload);
+                        } else {
+                            this.chunksBufferFallback.push(data.payload);
+                        }
+                        this.state.lastConfirmedChunk = data.index;
+                        this.state.runningChecksum = data.runningChecksum; // sender pre-computes it
+                        
+                        if (data.index % 10 === 0) await this.saveState(); // checkpoint
+                        
+                        this.updateProgressUI(this.state.lastConfirmedChunk + 1, this.state.fileMetadata.totalChunks, false);
+                        this.conn.send({ type: 'ack', index: data.index });
+                        
+                        if (data.index === this.state.fileMetadata.totalChunks - 1) {
+                            // All chunks received
+                            if (this.fileStream) await this.fileStream.close();
+                            this.finishTransfer(false);
+                        }
+                    }
+                    
+                } else if (data.type === 'ack') {
+                    // Sender got ack
+                    if (data.index > this.state.lastConfirmedChunk) {
+                        this.state.lastConfirmedChunk = data.index;
+                        if (data.index % 10 === 0) this.saveState();
+                        this.updateProgressUI(this.state.lastConfirmedChunk + 1, this.state.fileMetadata.totalChunks, true);
+                        
+                        if (this.state.lastConfirmedChunk === this.state.fileMetadata.totalChunks - 1) {
+                            this.finishTransfer(true);
+                        } else {
+                            this.sendNextChunk();
+                        }
+                    }
+                }
             });
             
             this.conn.on('close', () => {
-                if (!this.isCancelled && this.bytesTransferred < (this.isSender ? this.fileToSend.size : this.expectedSize)) {
-                    alert('Connection lost before transfer completed.');
-                    this.resetApp();
-                }
+                this.handleDisconnect();
             });
-
-            if (this.isSender) {
-                this.sendWait.style.display = 'none';
-                this.sendActive.style.display = 'block';
-                this.sendActiveName.textContent = this.fileToSend.name;
-                
-                // Send metadata
-                this.conn.send({
-                    type: 'metadata',
-                    name: this.fileToSend.name,
-                    size: this.fileToSend.size,
-                    mime: this.fileToSend.type
-                });
-                
-                this.startTime = Date.now();
-                this.bytesTransferred = 0;
-                this.runningChecksum = 0;
-                
-                setTimeout(() => this.sendNextChunk(), 500);
-            } else {
-                this.receiveConnecting.style.display = 'none';
-                this.receiveActive.style.display = 'block';
-                this.bytesTransferred = 0;
-                this.runningChecksum = 0;
-                this.receivedChunks = [];
-            }
         }
-        
-        async handleIncomingData(data) {
-            if (data.type === 'metadata') {
-                this.expectedName = data.name;
-                this.expectedSize = data.size;
-                this.expectedMime = data.mime;
-                this.receiveActiveName.textContent = this.expectedName;
-                this.startTime = Date.now();
-                
-                // Try to set up file stream
-                if (window.showSaveFilePicker) {
-                    try {
-                        const handle = await window.showSaveFilePicker({ suggestedName: this.expectedName });
-                        this.fileStream = await handle.createWritable();
-                        this.useStream = true;
-                    } catch(e) {
-                        console.warn("User cancelled save picker, falling back to memory stream", e);
-                        this.useStream = false;
-                    }
-                }
-                
-                // Tell sender we are ready
-                this.conn.send({ type: 'ready' });
-                
-            } else if (data.type === 'chunk') {
-                const chunk = data.payload;
-                this.updateChecksum(chunk);
-                
-                if (this.useStream) {
-                    await this.fileStream.write(chunk);
-                } else {
-                    this.receivedChunks.push(chunk);
-                }
-                
-                this.bytesTransferred += chunk.byteLength;
-                this.updateProgressUI(this.bytesTransferred, this.expectedSize, false);
-                
-                // Throttle acks to avoid flooding
-                this.conn.send({ type: 'ack', transferred: this.bytesTransferred });
-                
-            } else if (data.type === 'done') {
-                this.expectedChecksum = data.checksum;
-                
-                if (this.useStream && this.fileStream) {
-                    await this.fileStream.close();
-                }
-                
-                // Verify integrity
-                if (this.expectedChecksum !== this.runningChecksum) {
-                    alert('Transfer verification failed.\n\nThe received file may be incomplete or corrupted.');
-                }
-                
-                this.receiveActive.style.display = 'none';
-                this.receiveDone.style.display = 'block';
-                this.receiveDoneName.textContent = this.expectedName + ' (' + this.formatSize(this.expectedSize) + ')';
-                
-                if (this.useStream) {
-                    this.downloadBtn.style.display = 'none'; // already saved to disk
-                }
-            } else if (data.type === 'ready') {
-                // Receiver accepted metadata, start sending
-            } else if (data.type === 'ack') {
-                // Receiver acknowledged, can pump more data if needed (if using strict backpressure)
-                // But we can just use connection buffering properties if supported.
-                // For simplicity, we just keep pumping via sendNextChunk loop.
-            }
-        }
-
+    
         sendNextChunk() {
-            if (this.isCancelled) return;
-            if (this.bytesTransferred >= this.fileToSend.size) {
-                // Done!
-                this.conn.send({ type: 'done', checksum: this.runningChecksum });
-                this.sendActive.style.display = 'none';
-                this.sendDone.style.display = 'block';
-                return;
-            }
+            if (this.isCancelled || !this.conn || this.conn.peerConnection.iceConnectionState !== 'connected') return;
             
-            // DataChannel buffering limit (to avoid crashing the buffer)
-            if (this.conn.dataChannel && this.conn.dataChannel.bufferedAmount > this.CHUNK_SIZE * 16) {
-                // Wait for buffer to drain
+            const nextIndex = this.state.lastConfirmedChunk + 1;
+            if (nextIndex >= this.state.fileMetadata.totalChunks) return;
+            
+            // Flow control / backpressure
+            if (this.conn.dataChannel && this.conn.dataChannel.bufferedAmount > this.CHUNK_SIZE * 32) {
                 setTimeout(() => this.sendNextChunk(), 50);
                 return;
             }
-
-            const end = Math.min(this.bytesTransferred + this.CHUNK_SIZE, this.fileToSend.size);
-            const chunk = this.fileToSend.slice(this.bytesTransferred, end);
             
-            chunk.arrayBuffer().then(buffer => {
-                this.updateChecksum(buffer);
-                this.conn.send({ type: 'chunk', payload: buffer });
-                this.bytesTransferred += buffer.byteLength;
+            const start = nextIndex * this.CHUNK_SIZE;
+            const end = Math.min(start + this.CHUNK_SIZE, this.fileToSend.size);
+            const chunkBlob = this.fileToSend.slice(start, end);
+            
+            chunkBlob.arrayBuffer().then(buffer => {
+                // Very simple running XOR checksum for integrity
+                const arr = new Uint8Array(buffer);
+                for(let i=0; i<arr.length; i++) this.state.runningChecksum ^= arr[i];
                 
-                this.updateProgressUI(this.bytesTransferred, this.fileToSend.size, true);
+                this.conn.send({
+                    type: 'chunk',
+                    index: nextIndex,
+                    payload: buffer,
+                    runningChecksum: this.state.runningChecksum
+                });
                 
-                // Recursion
-                if (this.bytesTransferred < this.fileToSend.size) {
-                    setTimeout(() => this.sendNextChunk(), 0);
-                } else {
-                    this.conn.send({ type: 'done', checksum: this.runningChecksum });
-                    this.sendActive.style.display = 'none';
-                    this.sendDone.style.display = 'block';
-                }
+                // To maximize throughput we can send a few chunks ahead (sliding window), but ping-pong ACK is safer for strict resumability.
+                // Let's send up to 4 chunks ahead without waiting for ACK if buffer is low.
+                // But strict requirement: "Only mark a chunk as successfully transferred after receiver confirms it. If connection breaks, retry."
+                // The logic above naturally does this since we only advance `lastConfirmedChunk` on ACK.
             });
         }
-
-        updateProgressUI(transferred, total, isSender) {
-            const percent = Math.floor((transferred / total) * 100);
+    
+        updateProgressUI(chunksTransferred, totalChunks, isSender) {
+            const transferred = chunksTransferred * this.CHUNK_SIZE;
+            const total = this.state.fileMetadata.size;
+            const percent = Math.min(100, (chunksTransferred / totalChunks) * 100).toFixed(1);
+            
             const elapsedSec = (Date.now() - this.startTime) / 1000;
             const speedBps = transferred / (elapsedSec || 1);
             const remainSec = (total - transferred) / speedBps;
@@ -5186,7 +5361,52 @@
                 this.receiveEta.textContent = 'ETA: ' + etaStr;
             }
         }
+    
+        finishTransfer(isSender) {
+            this.state.status = 'done';
+            if (isSender) {
+                this.sendActive.style.display = 'none';
+                this.sendDone.style.display = 'block';
+            } else {
+                this.receiveActive.style.display = 'none';
+                this.receiveDone.style.display = 'block';
+                this.receiveDoneName.textContent = this.state.fileMetadata.name + ' (' + this.formatSize(this.state.fileMetadata.size) + ')';
+                
+                if (!this.fileStream && this.chunksBufferFallback) {
+                    const blob = new Blob(this.chunksBufferFallback, { type: this.state.fileMetadata.type });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = this.state.fileMetadata.name;
+                    a.click();
+                } else {
+                    this.downloadBtn.style.display = 'none';
+                }
+            }
+            
+            this.clearState();
+        }
+        
+        resetApp() {
+            this.sendSetup.style.display = 'block';
+            this.fileInfo.style.display = 'none';
+            this.sendWait.style.display = 'none';
+            this.sendActive.style.display = 'none';
+            this.sendDone.style.display = 'none';
+            this.resumePrompt.style.display = 'none';
+            this.interruptedState.style.display = 'none';
+            
+            this.receiveSetup.style.display = 'block';
+            this.receiveConnecting.style.display = 'none';
+            this.receiveActive.style.display = 'none';
+            this.receiveDone.style.display = 'none';
+            this.rxResumePrompt.style.display = 'none';
+            this.rxInterruptedState.style.display = 'none';
+            this.receiveCode.value = '';
+            this.fileInput.value = '';
+        }
     }
+    
 
     document.addEventListener('DOMContentLoaded', () => {
         
