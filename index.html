@@ -2415,7 +2415,7 @@
                             <span class="dz-icon">📦</span>
                             <div class="dz-label">Drop file here or click to browse</div>
                             <div class="dz-sublabel">Supports any file size up to 50GB</div>
-                            <input type="file" id="dt-file-input">
+                            <input type="file" id="dt-file-input" multiple>
                         </div>
                         <div id="dt-file-info" style="display:none; margin-top:16px; background:rgba(0,0,0,0.2); padding:16px; border-radius:8px;">
                             <div style="font-weight:600; margin-bottom:4px;" id="dt-file-name">filename.zip</div>
@@ -2476,6 +2476,12 @@
                             <div style="font-weight:600; margin-bottom:4px; font-size:16px; color:var(--color-green);" id="dt-rx-transfer-name">Project Files</div>
                             <div style="font-size:12px; color:rgba(255,255,255,0.6); margin-bottom:12px;">From: <span id="dt-rx-sender-name">Pankaj</span></div>
                             <div style="font-size:12px; font-family:'JetBrains Mono', monospace;" id="dt-rx-file-info">filename.zip (2.04 GB)</div>
+                        </div>
+                        
+                        <div id="dt-rx-next-file-prompt" style="display:none; background:rgba(0,0,0,0.3); padding:16px; border-radius:8px; margin-bottom:16px; border:1px solid var(--color-orange);">
+                            <div style="font-size:12px; color:var(--color-orange); margin-bottom:8px;">Next File Ready</div>
+                            <div style="font-family:'JetBrains Mono', monospace; font-size:12px; margin-bottom:12px;" id="dt-rx-next-filename">---</div>
+                            <button class="btn-export" id="dt-rx-save-next-btn" style="width:100%; background:var(--color-orange);">Save Next File</button>
                         </div>
                         
                         <div class="progress-bar-wrap">
@@ -4801,14 +4807,14 @@
     class DataTransferStudio {
     constructor() {
         this.peer = null;
-        this.fileToSend = null;
+        this.filesToSend = []; // Array of File objects
         
         this.MAX_FILE_SIZE = 50 * 1024 * 1024 * 1024;
         this.CHUNK_SIZE = 64 * 1024;
         
         // Sender tracking
-        this.receivers = new Map(); // clientId -> { conn, name, status, lastConfirmedChunk, runningChecksum, domEl, startTime }
-        this.pendingRequests = new Map(); // tempConnId -> { conn, name, clientId, domEl }
+        this.receivers = new Map();
+        this.pendingRequests = new Map();
         
         // Receiver tracking
         this.rxConn = null;
@@ -4819,15 +4825,15 @@
             transferId: null,
             senderName: null,
             transferName: null,
-            fileMetadata: null, // {name, size, type, totalChunks}
+            fileMetadata: null, // { totalSize, files: [{name, size, type, totalChunks}] }
             
             // Receiver specific
             clientId: null,
             receiverName: null,
+            currentFileIndex: 0,
             lastConfirmedChunk: -1,
             fileHandle: null,
             status: 'idle',
-            expectedChecksum: 0,
             runningChecksum: 0
         };
         
@@ -4843,7 +4849,6 @@
         this.dzZone = document.getElementById('dt-dz-zone');
         this.fileInput = document.getElementById('dt-file-input');
         
-        // Sender Setup
         this.sendSetup = document.getElementById('dt-send-setup');
         this.senderNameInput = document.getElementById('dt-sender-name');
         this.transferNameInput = document.getElementById('dt-transfer-name');
@@ -4852,7 +4857,6 @@
         this.fileSize = document.getElementById('dt-file-size');
         this.startBtn = document.getElementById('dt-start-btn');
         
-        // Sender Dashboard
         this.sendDashboard = document.getElementById('dt-send-dashboard');
         this.dashTransferName = document.getElementById('dt-dash-transfer-name');
         this.dashSenderName = document.getElementById('dt-dash-sender-name');
@@ -4862,13 +4866,11 @@
         this.receiversList = document.getElementById('dt-receivers-list');
         this.cancelSendBtn = document.getElementById('dt-cancel-send-btn');
         
-        // Receiver Setup
         this.receiveSetup = document.getElementById('dt-receive-setup');
         this.receiveCodeInput = document.getElementById('dt-receive-code');
         this.receiveNameInput = document.getElementById('dt-receive-name');
         this.connectBtn = document.getElementById('dt-connect-btn');
         
-        // Receiver States
         this.receiveConnecting = document.getElementById('dt-receive-connecting');
         this.rxStatusText = document.getElementById('dt-rx-status-text');
         this.rxStatusSubtext = document.getElementById('dt-rx-status-subtext');
@@ -4883,6 +4885,10 @@
         this.receiveSpeed = document.getElementById('dt-receive-speed');
         this.receiveEta = document.getElementById('dt-receive-eta');
         this.cancelRxBtn = document.getElementById('dt-cancel-rx-btn');
+        
+        this.rxNextFilePrompt = document.getElementById('dt-rx-next-file-prompt');
+        this.rxNextFilename = document.getElementById('dt-rx-next-filename');
+        this.rxSaveNextBtn = document.getElementById('dt-rx-save-next-btn');
         
         this.receiveDone = document.getElementById('dt-receive-done');
         this.receiveDoneName = document.getElementById('dt-receive-done-name');
@@ -4935,11 +4941,11 @@
         this.dzZone.addEventListener('drop', e => {
             e.preventDefault();
             this.dzZone.style.borderColor = 'rgba(249,92,21,0.3)';
-            if (e.dataTransfer.files.length) this.handleFileSelect(e.dataTransfer.files[0]);
+            if (e.dataTransfer.files.length) this.handleFileSelect(e.dataTransfer.files);
         });
         
         this.fileInput.addEventListener('change', e => {
-            if (e.target.files.length) this.handleFileSelect(e.target.files[0]);
+            if (e.target.files.length) this.handleFileSelect(e.target.files);
         });
         
         this.startBtn.addEventListener('click', () => this.startSendFlow());
@@ -4948,12 +4954,13 @@
         this.connectBtn.addEventListener('click', () => this.startReceiveFlow());
         this.cancelRxBtn.addEventListener('click', () => this.cancelTransfer());
         
-        // Receiver Resume buttons
         this.rxResumeBtn.addEventListener('click', () => this.resumeSession());
         this.rxCancelResumeBtn.addEventListener('click', () => this.cancelTransfer());
         
         this.rxManualResumeBtn.addEventListener('click', () => this.attemptReconnectReceiver());
         this.rxCancelInterruptedBtn.addEventListener('click', () => this.cancelTransfer());
+        
+        this.rxSaveNextBtn.addEventListener('click', () => this.saveNextFile());
     }
 
     formatSize(bytes) {
@@ -4979,8 +4986,8 @@
         this.state = {
             role: null, transferId: null, senderName: null, transferName: null,
             fileMetadata: null, clientId: null, receiverName: null,
-            lastConfirmedChunk: -1, fileHandle: null, status: 'idle',
-            expectedChecksum: 0, runningChecksum: 0
+            currentFileIndex: 0, lastConfirmedChunk: -1, fileHandle: null, 
+            status: 'idle', runningChecksum: 0
         };
     }
 
@@ -4991,20 +4998,21 @@
             this.state = session;
             
             if (this.state.role === 'sender') {
-                // Sender shouldn't refresh. We just reset if sender reloads because we lose the File object.
-                // Or we can let them re-select the file, but 1-to-N state (receivers) is hard to serialize.
-                // For simplicity in 1-to-N, if Sender reloads, the room drops.
                 this.clearState();
             } else {
-                // Receiver refresh recovery
                 const meta = this.state.fileMetadata;
-                const transferred = (this.state.lastConfirmedChunk + 1) * this.CHUNK_SIZE;
-                const percent = Math.min(100, Math.floor((transferred / meta.size) * 100));
-                const progText = `${percent}% (${this.formatSize(transferred)} / ${this.formatSize(meta.size)})`;
+                let transferredBytes = 0;
+                for (let i = 0; i < this.state.currentFileIndex; i++) {
+                    transferredBytes += meta.files[i].size;
+                }
+                transferredBytes += (this.state.lastConfirmedChunk + 1) * this.CHUNK_SIZE;
+                
+                const percent = Math.min(100, Math.floor((transferredBytes / meta.totalSize) * 100));
+                const progText = `${percent}% (${this.formatSize(transferredBytes)} / ${this.formatSize(meta.totalSize)})`;
                 
                 this.receiveSetup.style.display = 'none';
                 this.rxResumePrompt.style.display = 'block';
-                this.rxResumeFilename.textContent = meta.name;
+                this.rxResumeFilename.textContent = meta.files.length > 1 ? `${meta.files.length} files` : meta.files[0].name;
                 this.rxResumeProgress.textContent = progText;
             }
         }
@@ -5043,16 +5051,30 @@
         this.resetApp();
     }
 
-    handleFileSelect(file) {
-        if (file.size > this.MAX_FILE_SIZE) {
-            alert(`File too large.\n\nCreative Toolbox Data Transfer supports files up to 50 GB per transfer.`);
+    handleFileSelect(fileList) {
+        if (!fileList || fileList.length === 0) return;
+        
+        let totalSize = 0;
+        this.filesToSend = [];
+        
+        for (let i = 0; i < fileList.length; i++) {
+            totalSize += fileList[i].size;
+            this.filesToSend.push(fileList[i]);
+        }
+
+        if (totalSize > this.MAX_FILE_SIZE) {
+            alert(`Files too large.\n\nCreative Toolbox Data Transfer supports up to 50 GB per transfer.`);
             this.fileInput.value = '';
             return;
         }
 
-        this.fileToSend = file;
-        this.fileName.textContent = file.name;
-        this.fileSize.textContent = this.formatSize(file.size);
+        if (this.filesToSend.length === 1) {
+            this.fileName.textContent = this.filesToSend[0].name;
+        } else {
+            this.fileName.textContent = `${this.filesToSend.length} files`;
+        }
+        
+        this.fileSize.textContent = this.formatSize(totalSize);
         this.fileInfo.style.display = 'block';
     }
 
@@ -5064,15 +5086,25 @@
         
         const transferName = this.transferNameInput.value.trim() || 'File Transfer';
         
+        let totalSize = 0;
+        const fileMetaArr = [];
+        for (let file of this.filesToSend) {
+            totalSize += file.size;
+            fileMetaArr.push({
+                name: file.name,
+                size: file.size,
+                type: file.type,
+                totalChunks: Math.ceil(file.size / this.CHUNK_SIZE)
+            });
+        }
+        
         this.state.role = 'sender';
         this.state.transferId = Math.floor(100000 + Math.random() * 900000).toString();
         this.state.senderName = name;
         this.state.transferName = transferName;
         this.state.fileMetadata = {
-            name: this.fileToSend.name,
-            size: this.fileToSend.size,
-            type: this.fileToSend.type,
-            totalChunks: Math.ceil(this.fileToSend.size / this.CHUNK_SIZE)
+            totalSize: totalSize,
+            files: fileMetaArr
         };
         await this.saveState();
 
@@ -5081,7 +5113,7 @@
         
         this.dashTransferName.textContent = transferName;
         this.dashSenderName.textContent = name;
-        this.dashFileInfo.textContent = `${this.fileToSend.name} (${this.formatSize(this.fileToSend.size)})`;
+        this.dashFileInfo.textContent = `${this.filesToSend.length} files (${this.formatSize(totalSize)})`;
         this.sendCode.textContent = this.state.transferId;
         
         if (window.QRCode) {
@@ -5096,11 +5128,7 @@
     initSenderPeer() {
         if (this.peer) this.peer.destroy();
         this.peer = new Peer(this.state.transferId, { debug: 2 });
-        
-        this.peer.on('connection', (conn) => {
-            this.setupSenderConnection(conn);
-        });
-        
+        this.peer.on('connection', (conn) => this.setupSenderConnection(conn));
         this.peer.on('error', (err) => console.error('Sender peer error:', err));
     }
     
@@ -5109,14 +5137,13 @@
             if (data.type === 'join_request') {
                 this.handleJoinRequest(conn, data);
             } else if (data.type === 'ready') {
-                this.handleReceiverReady(data.clientId, data.lastConfirmedChunk);
+                this.handleReceiverReady(data.clientId, data.currentFileIndex, data.lastConfirmedChunk);
             } else if (data.type === 'ack') {
-                this.handleReceiverAck(data.clientId, data.index);
+                this.handleReceiverAck(data.clientId, data.fileIndex, data.chunkIndex);
             }
         });
         
         conn.on('close', () => {
-            // Find which receiver this was and mark as disconnected
             let foundId = null;
             for (let [id, rcvr] of this.receivers.entries()) {
                 if (rcvr.conn && rcvr.conn.peer === conn.peer) {
@@ -5127,7 +5154,6 @@
                 }
             }
             if (!foundId) {
-                // Check pending
                 for (let [tempId, req] of this.pendingRequests.entries()) {
                     if (req.conn.peer === conn.peer) {
                         req.domEl.remove();
@@ -5143,7 +5169,6 @@
         const clientId = data.clientId;
         const name = data.name;
         
-        // 1. Check if returning receiver
         if (this.receivers.has(clientId)) {
             const rcvr = this.receivers.get(clientId);
             rcvr.conn = conn;
@@ -5158,7 +5183,6 @@
             return;
         }
         
-        // 2. New receiver - ask for approval
         const tempId = Math.random().toString(36).substr(2, 9);
         const reqEl = document.createElement('div');
         reqEl.style.cssText = "background:rgba(255,255,255,0.05); padding:16px; border-radius:8px; border-left:3px solid var(--color-orange);";
@@ -5173,8 +5197,6 @@
         this.receiversList.appendChild(reqEl);
         
         this.pendingRequests.set(tempId, { conn, name, clientId, domEl: reqEl });
-        
-        // Global helpers for inline onclick
         window.dtAccept = (id) => this.acceptRequest(id);
         window.dtDecline = (id) => this.declineRequest(id);
     }
@@ -5182,11 +5204,9 @@
     acceptRequest(tempId) {
         const req = this.pendingRequests.get(tempId);
         if (!req) return;
-        
         req.domEl.remove();
         this.pendingRequests.delete(tempId);
         
-        // Create receiver state
         const domEl = document.createElement('div');
         domEl.style.cssText = "background:rgba(255,255,255,0.05); padding:16px; border-radius:8px;";
         domEl.innerHTML = `
@@ -5205,6 +5225,7 @@
                 <span class="rx-speed">Speed: --</span>
                 <span class="rx-eta">ETA: --</span>
             </div>
+            <div class="rx-file-details" style="font-size:10px; color:var(--color-orange); margin-top:4px;"></div>
         `;
         this.receiversList.appendChild(domEl);
         
@@ -5216,6 +5237,7 @@
             conn: req.conn,
             name: req.name,
             status: 'active',
+            currentFileIndex: 0,
             lastConfirmedChunk: -1,
             runningChecksum: 0,
             domEl: domEl,
@@ -5250,9 +5272,10 @@
         }
     }
 
-    handleReceiverReady(clientId, lastConfirmedChunk) {
+    handleReceiverReady(clientId, currentFileIndex, lastConfirmedChunk) {
         const rcvr = this.receivers.get(clientId);
         if (!rcvr) return;
+        rcvr.currentFileIndex = currentFileIndex;
         rcvr.lastConfirmedChunk = lastConfirmedChunk;
         rcvr.startTime = Date.now();
         rcvr.status = 'receiving';
@@ -5260,16 +5283,21 @@
         this.sendNextChunk(clientId);
     }
     
-    handleReceiverAck(clientId, index) {
+    handleReceiverAck(clientId, fileIndex, chunkIndex) {
         const rcvr = this.receivers.get(clientId);
         if (!rcvr) return;
         
-        if (index > rcvr.lastConfirmedChunk) {
-            rcvr.lastConfirmedChunk = index;
+        if (fileIndex === rcvr.currentFileIndex && chunkIndex > rcvr.lastConfirmedChunk) {
+            rcvr.lastConfirmedChunk = chunkIndex;
             this.updateReceiverUI(clientId);
             
-            if (rcvr.lastConfirmedChunk === this.state.fileMetadata.totalChunks - 1) {
-                rcvr.status = 'done';
+            const currentFileMeta = this.state.fileMetadata.files[rcvr.currentFileIndex];
+            if (rcvr.lastConfirmedChunk >= currentFileMeta.totalChunks - 1) {
+                // Wait for receiver to send 'ready' for the next file
+                rcvr.status = 'waiting_for_next_file';
+                if (rcvr.currentFileIndex >= this.state.fileMetadata.files.length - 1) {
+                    rcvr.status = 'done';
+                }
                 this.updateReceiverUI(clientId);
             } else {
                 this.sendNextChunk(clientId);
@@ -5281,18 +5309,19 @@
         const rcvr = this.receivers.get(clientId);
         if (this.isCancelled || !rcvr || !rcvr.conn || rcvr.status !== 'receiving') return;
         
+        const currentFileMeta = this.state.fileMetadata.files[rcvr.currentFileIndex];
         const nextIndex = rcvr.lastConfirmedChunk + 1;
-        if (nextIndex >= this.state.fileMetadata.totalChunks) return;
+        if (nextIndex >= currentFileMeta.totalChunks) return;
         
-        // Flow control
         if (rcvr.conn.dataChannel && rcvr.conn.dataChannel.bufferedAmount > this.CHUNK_SIZE * 32) {
             setTimeout(() => this.sendNextChunk(clientId), 50);
             return;
         }
         
+        const fileObj = this.filesToSend[rcvr.currentFileIndex];
         const start = nextIndex * this.CHUNK_SIZE;
-        const end = Math.min(start + this.CHUNK_SIZE, this.fileToSend.size);
-        const chunkBlob = this.fileToSend.slice(start, end);
+        const end = Math.min(start + this.CHUNK_SIZE, fileObj.size);
+        const chunkBlob = fileObj.slice(start, end);
         
         chunkBlob.arrayBuffer().then(buffer => {
             const arr = new Uint8Array(buffer);
@@ -5300,7 +5329,8 @@
             
             rcvr.conn.send({
                 type: 'chunk',
-                index: nextIndex,
+                fileIndex: rcvr.currentFileIndex,
+                chunkIndex: nextIndex,
                 payload: buffer,
                 runningChecksum: rcvr.runningChecksum
             });
@@ -5311,30 +5341,37 @@
         const rcvr = this.receivers.get(clientId);
         if (!rcvr || !rcvr.domEl) return;
         
-        const chunks = rcvr.lastConfirmedChunk + 1;
-        const totalChunks = this.state.fileMetadata.totalChunks;
-        const transferred = chunks * this.CHUNK_SIZE;
-        const total = this.state.fileMetadata.size;
-        const percent = Math.min(100, (chunks / totalChunks) * 100).toFixed(1);
+        let transferredBytes = 0;
+        for (let i = 0; i < rcvr.currentFileIndex; i++) {
+            transferredBytes += this.state.fileMetadata.files[i].size;
+        }
+        transferredBytes += (rcvr.lastConfirmedChunk + 1) * this.CHUNK_SIZE;
+        const total = this.state.fileMetadata.totalSize;
+        const percent = Math.min(100, (transferredBytes / total) * 100).toFixed(1);
         
         const elapsedSec = (Date.now() - rcvr.startTime) / 1000;
-        const speedBps = transferred / (elapsedSec || 1);
-        const remainSec = (total - transferred) / speedBps;
+        const speedBps = transferredBytes / (elapsedSec || 1);
+        const remainSec = (total - transferredBytes) / speedBps;
         
         const speedStr = this.formatSize(speedBps) + '/s';
         const etaStr = isFinite(remainSec) && rcvr.status === 'receiving' ? Math.ceil(remainSec) + 's' : '--';
         
         rcvr.domEl.querySelector('.rx-progress-fill').style.width = percent + '%';
-        rcvr.domEl.querySelector('.rx-amount').textContent = `${this.formatSize(transferred)} / ${this.formatSize(total)}`;
+        rcvr.domEl.querySelector('.rx-amount').textContent = `${this.formatSize(transferredBytes)} / ${this.formatSize(total)}`;
         rcvr.domEl.querySelector('.rx-percent').textContent = percent + '%';
         rcvr.domEl.querySelector('.rx-speed').textContent = rcvr.status === 'receiving' ? 'Speed: ' + speedStr : '';
         rcvr.domEl.querySelector('.rx-eta').textContent = rcvr.status === 'receiving' ? 'ETA: ' + etaStr : '';
+        rcvr.domEl.querySelector('.rx-file-details').textContent = `File ${rcvr.currentFileIndex + 1} of ${this.state.fileMetadata.files.length}`;
         
         const statusEl = rcvr.domEl.querySelector('.rx-status');
         if (rcvr.status === 'receiving') {
             statusEl.textContent = 'Receiving';
             statusEl.style.background = 'rgba(0,255,0,0.2)';
             statusEl.style.color = 'var(--color-green)';
+        } else if (rcvr.status === 'waiting_for_next_file') {
+            statusEl.textContent = 'Waiting for User to save next file';
+            statusEl.style.background = 'rgba(255,165,0,0.2)';
+            statusEl.style.color = 'var(--color-orange)';
         } else if (rcvr.status === 'interrupted') {
             statusEl.textContent = 'Interrupted';
             statusEl.style.background = 'rgba(255,165,0,0.2)';
@@ -5402,15 +5439,23 @@
         
         this.receiveConnecting.style.display = 'none';
         this.receiveActive.style.display = 'none';
+        this.rxNextFilePrompt.style.display = 'none';
         
         if (this.rxManualResumeBtn) {
             this.rxManualResumeBtn.textContent = 'Resume Transfer';
             this.rxManualResumeBtn.disabled = false;
         }
         
-        const transferred = (this.state.lastConfirmedChunk + 1) * this.CHUNK_SIZE;
-        const total = this.state.fileMetadata ? this.state.fileMetadata.size : 0;
-        const progText = `${this.formatSize(transferred)} / ${this.formatSize(total)}`;
+        let transferredBytes = 0;
+        if (this.state.fileMetadata) {
+            for (let i = 0; i < this.state.currentFileIndex; i++) {
+                transferredBytes += this.state.fileMetadata.files[i].size;
+            }
+            transferredBytes += (this.state.lastConfirmedChunk + 1) * this.CHUNK_SIZE;
+        }
+        
+        const total = this.state.fileMetadata ? this.state.fileMetadata.totalSize : 0;
+        const progText = `${this.formatSize(transferredBytes)} / ${this.formatSize(total)}`;
         
         this.rxInterruptedState.style.display = 'block';
         this.rxInterruptedProgress.textContent = progText;
@@ -5447,63 +5492,71 @@
                 // Storage check
                 if (navigator.storage && navigator.storage.estimate) {
                     const est = await navigator.storage.estimate();
-                    if (est.quota && est.quota - est.usage < this.state.fileMetadata.size) {
-                        alert("Not enough storage space.\nThe receiving device does not have enough available storage for this file.");
+                    if (est.quota && est.quota - est.usage < this.state.fileMetadata.totalSize) {
+                        alert("Not enough storage space.\nThe receiving device does not have enough available storage for all files.");
                         this.cancelTransfer();
                         return;
                     }
                 }
                 
-                if (!this.fileStream) {
-                    if (window.showSaveFilePicker) {
-                        try {
-                            const handle = await window.showSaveFilePicker({ suggestedName: this.state.fileMetadata.name });
-                            this.state.fileHandle = handle;
-                            this.fileStream = await handle.createWritable();
-                            await this.saveState();
-                        } catch(e) {
-                            alert("Transfer cancelled by user.");
-                            this.cancelTransfer();
-                            return;
-                        }
-                    } else {
-                        alert("Browser does not support File System Access API. Transfers >1GB may crash.");
-                        this.chunksBufferFallback = [];
-                    }
-                }
-                
+                // Set UI
                 this.receiveConnecting.style.display = 'none';
                 this.receiveActive.style.display = 'block';
                 this.rxTransferName.textContent = data.transferName;
                 this.rxSenderName.textContent = data.senderName;
-                this.rxFileInfo.textContent = `${this.state.fileMetadata.name} (${this.formatSize(this.state.fileMetadata.size)})`;
+                
+                const metaFiles = this.state.fileMetadata.files;
+                this.rxFileInfo.textContent = metaFiles.length > 1 
+                    ? `${metaFiles.length} files (${this.formatSize(this.state.fileMetadata.totalSize)})`
+                    : `${metaFiles[0].name} (${this.formatSize(this.state.fileMetadata.totalSize)})`;
                 
                 this.startTime = Date.now();
-                this.rxConn.send({ type: 'ready', lastConfirmedChunk: this.state.lastConfirmedChunk, clientId: this.state.clientId });
+                
+                // Begin stream of current file index
+                this.startReceivingCurrentFile();
                 
             } else if (data.type === 'chunk') {
-                if (data.index <= this.state.lastConfirmedChunk) {
-                    this.rxConn.send({ type: 'ack', index: data.index, clientId: this.state.clientId });
+                if (data.fileIndex < this.state.currentFileIndex) {
+                    // Stale chunk from previous file, ignore
                     return;
                 }
                 
-                if (data.index === this.state.lastConfirmedChunk + 1) {
+                if (data.chunkIndex <= this.state.lastConfirmedChunk) {
+                    this.rxConn.send({ type: 'ack', fileIndex: data.fileIndex, chunkIndex: data.chunkIndex, clientId: this.state.clientId });
+                    return;
+                }
+                
+                if (data.chunkIndex === this.state.lastConfirmedChunk + 1) {
                     if (this.fileStream) {
                         await this.fileStream.write(data.payload);
                     } else {
                         this.chunksBufferFallback.push(data.payload);
                     }
-                    this.state.lastConfirmedChunk = data.index;
+                    this.state.lastConfirmedChunk = data.chunkIndex;
                     this.state.runningChecksum = data.runningChecksum;
                     
-                    if (data.index % 10 === 0) await this.saveState();
+                    if (data.chunkIndex % 10 === 0) await this.saveState();
                     
-                    this.updateRxProgressUI(this.state.lastConfirmedChunk + 1, this.state.fileMetadata.totalChunks);
-                    this.rxConn.send({ type: 'ack', index: data.index, clientId: this.state.clientId });
+                    this.updateRxProgressUI(data.fileIndex, data.chunkIndex);
+                    this.rxConn.send({ type: 'ack', fileIndex: data.fileIndex, chunkIndex: data.chunkIndex, clientId: this.state.clientId });
                     
-                    if (data.index === this.state.fileMetadata.totalChunks - 1) {
+                    const currentMeta = this.state.fileMetadata.files[data.fileIndex];
+                    if (data.chunkIndex === currentMeta.totalChunks - 1) {
+                        // File complete
                         if (this.fileStream) await this.fileStream.close();
-                        this.finishRxTransfer();
+                        else this.triggerFallbackDownload(currentMeta.name, currentMeta.type);
+                        
+                        this.state.currentFileIndex++;
+                        this.state.lastConfirmedChunk = -1;
+                        this.state.runningChecksum = 0;
+                        await this.saveState();
+                        
+                        if (this.state.currentFileIndex >= this.state.fileMetadata.files.length) {
+                            this.finishRxTransfer();
+                        } else {
+                            // Show prompt for the next file since we need a user gesture for FileSystem API
+                            this.promptSaveNextFile();
+                        }
                     }
                 }
             }
@@ -5511,42 +5564,93 @@
         
         this.rxConn.on('close', () => this.handleRxDisconnect());
     }
+    
+    async startReceivingCurrentFile() {
+        if (!this.fileStream) {
+            const currentMeta = this.state.fileMetadata.files[this.state.currentFileIndex];
+            if (window.showSaveFilePicker) {
+                try {
+                    const handle = await window.showSaveFilePicker({ suggestedName: currentMeta.name });
+                    this.state.fileHandle = handle;
+                    this.fileStream = await handle.createWritable();
+                    await this.saveState();
+                } catch(e) {
+                    alert("Transfer paused. You must select a save location to continue.");
+                    this.promptSaveNextFile();
+                    return;
+                }
+            } else {
+                this.chunksBufferFallback = [];
+            }
+        }
+        
+        this.rxConn.send({ 
+            type: 'ready', 
+            currentFileIndex: this.state.currentFileIndex,
+            lastConfirmedChunk: this.state.lastConfirmedChunk,
+            clientId: this.state.clientId 
+        });
+    }
 
-    updateRxProgressUI(chunksTransferred, totalChunks) {
-        const transferred = chunksTransferred * this.CHUNK_SIZE;
-        const total = this.state.fileMetadata.size;
-        const percent = Math.min(100, (chunksTransferred / totalChunks) * 100).toFixed(1);
+    promptSaveNextFile() {
+        this.fileStream = null; // Clear previous handle
+        this.state.fileHandle = null;
+        const nextMeta = this.state.fileMetadata.files[this.state.currentFileIndex];
+        this.rxNextFilename.textContent = nextMeta.name + " (" + this.formatSize(nextMeta.size) + ")";
+        this.rxNextFilePrompt.style.display = 'block';
+    }
+    
+    async saveNextFile() {
+        this.rxNextFilePrompt.style.display = 'none';
+        await this.startReceivingCurrentFile();
+    }
+
+    updateRxProgressUI(fileIndex, chunkIndex) {
+        let transferredBytes = 0;
+        for (let i = 0; i < fileIndex; i++) {
+            transferredBytes += this.state.fileMetadata.files[i].size;
+        }
+        transferredBytes += (chunkIndex + 1) * this.CHUNK_SIZE;
+        
+        const total = this.state.fileMetadata.totalSize;
+        const percent = Math.min(100, (transferredBytes / total) * 100).toFixed(1);
         
         const elapsedSec = (Date.now() - this.startTime) / 1000;
-        const speedBps = transferred / (elapsedSec || 1);
-        const remainSec = (total - transferred) / speedBps;
+        const speedBps = transferredBytes / (elapsedSec || 1);
+        const remainSec = (total - transferredBytes) / speedBps;
         
         const speedStr = this.formatSize(speedBps) + '/s';
         const etaStr = isFinite(remainSec) ? Math.ceil(remainSec) + 's' : '--';
         
         this.receiveProgressFill.style.width = percent + '%';
-        this.receiveAmount.textContent = `${this.formatSize(transferred)} / ${this.formatSize(total)}`;
+        this.receiveAmount.textContent = `${this.formatSize(transferredBytes)} / ${this.formatSize(total)}`;
         this.receivePercent.textContent = percent + '%';
         this.receiveSpeed.textContent = 'Speed: ' + speedStr;
         this.receiveEta.textContent = 'ETA: ' + etaStr;
+    }
+    
+    triggerFallbackDownload(filename, type) {
+        if (!this.chunksBufferFallback || this.chunksBufferFallback.length === 0) return;
+        const blob = new Blob(this.chunksBufferFallback, { type: type });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        a.click();
+        this.chunksBufferFallback = [];
     }
 
     finishRxTransfer() {
         this.state.status = 'done';
         this.receiveActive.style.display = 'none';
         this.receiveDone.style.display = 'block';
-        this.receiveDoneName.textContent = this.state.fileMetadata.name + ' (' + this.formatSize(this.state.fileMetadata.size) + ')';
         
-        if (!this.fileStream && this.chunksBufferFallback) {
-            const blob = new Blob(this.chunksBufferFallback, { type: this.state.fileMetadata.type });
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = this.state.fileMetadata.name;
-            a.click();
-        } else {
-            this.downloadBtn.style.display = 'none';
-        }
+        const metaFiles = this.state.fileMetadata.files;
+        this.receiveDoneName.textContent = metaFiles.length > 1 
+            ? `${metaFiles.length} files saved.`
+            : `${metaFiles[0].name} saved.`;
+            
+        this.downloadBtn.style.display = 'none'; // Auto saved using FileSystem API or fallback
         this.clearState();
     }
     
@@ -5564,6 +5668,7 @@
         this.receiveDone.style.display = 'none';
         this.rxResumePrompt.style.display = 'none';
         this.rxInterruptedState.style.display = 'none';
+        this.rxNextFilePrompt.style.display = 'none';
         this.receiveCodeInput.value = '';
         this.fileInput.value = '';
     }
