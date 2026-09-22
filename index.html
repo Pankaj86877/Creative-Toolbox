@@ -5148,12 +5148,12 @@
         attemptReconnect() {
             console.log("Attempting reconnect...");
             if (this.state.role === 'sender') {
-                this.interruptedState.style.display = 'none';
-                this.sendWait.style.display = 'block';
+                this.manualResumeBtn.textContent = 'Reconnecting...';
+                this.manualResumeBtn.disabled = true;
                 this.initPeer(this.state.transferId);
             } else {
-                this.rxInterruptedState.style.display = 'none';
-                this.receiveConnecting.style.display = 'block';
+                this.rxManualResumeBtn.textContent = 'Reconnecting...';
+                this.rxManualResumeBtn.disabled = true;
                 this.initPeer();
             }
         }
@@ -5167,6 +5167,16 @@
             this.receiveConnecting.style.display = 'none';
             this.receiveActive.style.display = 'none';
             
+            // Reset button states in case they were reconnecting
+            if (this.manualResumeBtn) {
+                this.manualResumeBtn.textContent = 'Resume Transfer';
+                this.manualResumeBtn.disabled = false;
+            }
+            if (this.rxManualResumeBtn) {
+                this.rxManualResumeBtn.textContent = 'Resume Transfer';
+                this.rxManualResumeBtn.disabled = false;
+            }
+            
             const transferred = (this.state.lastConfirmedChunk + 1) * this.CHUNK_SIZE;
             const total = this.state.fileMetadata ? this.state.fileMetadata.size : 0;
             const progText = `${this.formatSize(transferred)} / ${this.formatSize(total)}`;
@@ -5179,8 +5189,7 @@
                 this.rxInterruptedProgress.textContent = progText;
             }
             
-            // Auto reconnect loop
-            setTimeout(() => this.attemptReconnect(), 3000);
+            // Auto reconnect loop removed to allow explicit manual reconnect button
         }
     
         setupConnection() {
@@ -5188,6 +5197,16 @@
                 console.log('Data channel open');
                 this.interruptedState.style.display = 'none';
                 this.rxInterruptedState.style.display = 'none';
+                
+                // Reset button states
+                if (this.manualResumeBtn) {
+                    this.manualResumeBtn.textContent = 'Resume Transfer';
+                    this.manualResumeBtn.disabled = false;
+                }
+                if (this.rxManualResumeBtn) {
+                    this.rxManualResumeBtn.textContent = 'Resume Transfer';
+                    this.rxManualResumeBtn.disabled = false;
+                }
                 
                 if (this.state.role === 'sender') {
                     this.sendWait.style.display = 'none';
