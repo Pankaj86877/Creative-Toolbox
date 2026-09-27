@@ -4427,6 +4427,19 @@
             this.convertBtn.addEventListener('click', () => this.convertVideo());
         }
 
+        resetState() {
+            this.resultContainer.style.display = 'none';
+            this.gifOutput.src = '';
+            this.progressWrap.style.display = 'none';
+            this.progressFill.style.width = '0%';
+            this.errorMsg.style.display = 'none';
+            this.statusChip.className = 'status-chip idle';
+            this.statusChip.textContent = 'Waiting';
+            this.trimControls.style.opacity = '0.5';
+            this.trimControls.style.pointerEvents = 'none';
+            this.convertBtn.disabled = true;
+        }
+
         handleFile(file) {
             if (!file.type.startsWith('video/')) {
                 this.showError("Please upload a valid video file.");
