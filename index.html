@@ -4512,7 +4512,7 @@
             this.videoPreview.currentTime = isStart ? start : end;
         }
 
-        convertVideo() {
+        async convertVideo() {
             if (!this.selectedFileUrl || !window.gifshot) return;
 
             this.convertBtn.disabled = true;
@@ -4522,7 +4522,7 @@
             this.statusChip.textContent = 'Processing...';
             this.progressWrap.style.display = 'block';
             this.progressFill.style.width = '0%';
-            this.processingStatus.textContent = "Initializing GIF Engine...";
+            this.processingStatus.textContent = "Initializing Engine...";
             
             const compLevel = this.compressionSelect.value;
             const startOffset = parseFloat(this.startTimeInput.value);
@@ -4532,24 +4532,75 @@
             const targetW = parseInt(this.resizeW.value) || this.origWidth || 480;
             const targetH = parseInt(this.resizeH.value) || this.origHeight || 480;
 
-            let config = { sampleInt: 10, fpsMultiplier: 10 };
-
-            if (compLevel === 'low') { config.sampleInt = 5; config.fpsMultiplier = 10; } 
-            else if (compLevel === 'medium') { config.sampleInt = 15; config.fpsMultiplier = 7; } 
-            else if (compLevel === 'high') { config.sampleInt = 30; config.fpsMultiplier = 5; }
+            let fps = 10;
+            if (compLevel === 'low') fps = 5;
+            if (compLevel === 'medium') fps = 7;
+            if (compLevel === 'high') fps = 10;
+            
+            const totalFrames = Math.max(1, Math.floor(clipDuration * fps));
+            const frameInterval = 1 / fps;
+            
+            const canvas = document.createElement('canvas');
+            canvas.width = targetW;
+            canvas.height = targetH;
+            const ctx = canvas.getContext('2d', { willReadFrequently: true });
+            
+            const images = [];
+            const originalTime = this.videoPreview.currentTime;
+            
+            try {
+                // Ensure video is somewhat loaded
+                if (this.videoPreview.readyState < 2) {
+                    await new Promise(r => {
+                        const h = () => { this.videoPreview.removeEventListener('loadeddata', h); r(); };
+                        this.videoPreview.addEventListener('loadeddata', h);
+                    });
+                }
+                
+                for (let i = 0; i < totalFrames; i++) {
+                    const time = startOffset + (i * frameInterval);
+                    this.videoPreview.currentTime = time;
+                    
+                    await new Promise(resolve => {
+                        const handler = () => {
+                            this.videoPreview.removeEventListener('seeked', handler);
+                            resolve();
+                        };
+                        this.videoPreview.addEventListener('seeked', handler);
+                        // Fallback just in case seeked doesn't fire
+                        setTimeout(resolve, 500);
+                    });
+                    
+                    ctx.drawImage(this.videoPreview, 0, 0, targetW, targetH);
+                    images.push(canvas.toDataURL('image/jpeg', 0.8));
+                    
+                    const percent = Math.round(((i + 1) / totalFrames) * 50);
+                    this.progressFill.style.width = `${percent}%`;
+                    this.processingStatus.textContent = `Extracting Frames: ${percent}%`;
+                }
+            } catch (err) {
+                this.showError("Failed to extract frames from video.");
+                this.convertBtn.disabled = false;
+                this.trimControls.style.opacity = '1';
+                this.trimControls.style.pointerEvents = 'auto';
+                this.progressWrap.style.display = 'none';
+                return;
+            } finally {
+                this.videoPreview.currentTime = originalTime;
+            }
+            
+            this.processingStatus.textContent = "Generating GIF...";
 
             gifshot.createGIF({
-                video: [this.selectedFileUrl],
-                offset: startOffset,
-                numFrames: Math.floor(clipDuration * config.fpsMultiplier), 
-                frameDuration: 10 / config.fpsMultiplier,
+                images: images,
                 gifWidth: targetW, 
                 gifHeight: targetH, 
-                sampleInterval: config.sampleInt, 
+                frameDuration: 10 / fps, // gifshot uses units of 10ms. 10/10 = 1 (100ms) -> 10fps
+                sampleInterval: compLevel === 'low' ? 5 : (compLevel === 'medium' ? 15 : 30),
                 progressCallback: (captureProgress) => {
-                    const percent = Math.round(captureProgress * 100);
+                    const percent = 50 + Math.round(captureProgress * 50);
                     this.progressFill.style.width = `${percent}%`;
-                    this.processingStatus.textContent = `Rendering Frames: ${percent}%`;
+                    this.processingStatus.textContent = `Rendering GIF: ${percent}%`;
                 }
             }, (obj) => {
                 if (!obj.error) {
