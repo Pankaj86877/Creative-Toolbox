@@ -4441,7 +4441,7 @@
         }
 
         handleFile(file) {
-            if (!file.type.startsWith('video/')) {
+            if (!file.type.startsWith('video/') && !file.name.toLowerCase().match(/\.(mp4|webm|ogg|mov)$/)) {
                 this.showError("Please upload a valid video file.");
                 return;
             }
@@ -4454,6 +4454,7 @@
             this.selectedFileUrl = URL.createObjectURL(file);
             this.videoPreview.src = this.selectedFileUrl;
             this.videoPreview.style.display = 'block';
+            this.videoPreview.load(); // Required for some browsers to trigger metadata load
             this.videoMeta.textContent = `${(file.size / 1024 / 1024).toFixed(2)} MB`;
 
             this.videoPreview.onloadedmetadata = () => {
